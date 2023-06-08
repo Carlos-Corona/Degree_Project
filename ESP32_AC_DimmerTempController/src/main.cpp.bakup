@@ -1,0 +1,258 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <MAX6675.h>
+//#include <RBDdimmer.h>
+#include <SPI.h>
+#include <PID.h>
+#include <dimmable_light.h>
+enum Command {
+    HSKP, // Handshake
+    STMP, // Set desired temperature
+    RFLO, // Start reflowing
+    RFST, // Stop reflowing
+    RDTM, // Read temperature
+    MPID, // Set/Modify PID values
+    INVALID, // Invalid command
+};
+Command getCommand(const char* menuOption) {
+    if (strcmp(menuOption, "HSKP") == 0) return HSKP;
+    if (strcmp(menuOption, "STMP") == 0) return STMP;
+    if (strcmp(menuOption, "RFLO") == 0) return RFLO;
+    if (strcmp(menuOption, "RFST") == 0) return RFST;
+    if (strcmp(menuOption, "RDTM") == 0) return RDTM;
+    if (strcmp(menuOption, "MPID") == 0) return MPID;
+    return INVALID;
+}
+
+// ------ ESP32 I2C PINS -------
+//#define SDA y SCL pins esp32
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define INTERRUPT_PIN GPIO_NUM_2 // GPIO SEND HIGH TO MASTER TO REQUEST PETITION
+#define Standard 100000          // 100kHz
+#define FastMode 400000          // 400kHz
+#define I2C_SlaveAddress 0x04
+#define I2C_MasterAddress 0x01
+
+// ------ I2C DATA STRUCTURE -------
+struct I2CData
+{
+  char data[32] = {'\0'};
+  char command[5] = {'\0'};
+};
+
+I2CData TxData, RxData;
+byte address_Slave = I2C_SlaveAddress;
+
+char data[32];
+char command[5];
+
+void pinRequestInterrupt();                                      // Function to send interrupt to master
+void menu_interaction(int);                                      // Menu interaction function for I2C
+void sendEvent(char data[32], char command[5], I2CData &Txdata); // I2C send event
+void receiveEvent(int);                                          // I2C receive event
+void requestEvent();                                             // I2C request event
+void HandShake();                                                // I2C handshake
+
+// // // ------ MAX6675 PINS -------
+int thermoDO = 19;
+int thermoCS = 23;
+int thermoCLK = 5;
+
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+
+float readTemperature(); // Function to read temperature from thermocouple
+
+// ------------------ PID ------------------
+float Kp = 20;                                // determina el efecto proporcional del error en la salida del controlador, se utiliza para ajustar la velocidad de respuesta del sistema
+float Ki = 0.2;                               // determina el efecto integral del error en la salida del controlador, se utiliza para corregir el error acumulado a lo largo del tiempo.
+float Kd = 200;                               // determina el efecto derivativo del error en la salida del controlador, se utiliza para ajustar la estabilidad del sistema ante cambios bruscos en el valor deseado.
+float prev_Error = 0;                         // la diferencia entre el valor deseado y el valor actual del proceso en el instante anterior
+float T = 1;                                  // Tiempo de muestreo en segundos. 1s = 1000ms
+float referenceTemp = 0;                      // Temperature reference in °C
+float temperatura_average = 0;                // Temperature average of 4 samples in 1 second (250ms sample time)
+PIDController pid(Kp, Ki, Kd, prev_Error, T); // PID controller
+
+void control_ACDimer(float); // Function to control AC dimmer with PID output value
+
+// ------------------ Dimmer ------------------
+
+#define CHANNEL_L1 4 // output channel 1 pin for dimmer ROBOTDYN
+#define CHANNEL_L2 15 // output channel 2 pin for dimmer ROBOTDYN
+#define ZEROCROSS 18  // input zero cross pin for dimmer ROBOTDYN
+
+// dimmerLamp dimmer(CHANNEL_L1, ZEROCROSS); //initialase port for dimmer for ESP8266, ESP32, Arduino due boards
+
+//const int syncPin = 13;
+
+DimmableLight light1(CHANNEL_L1);
+DimmableLight light2(CHANNEL_L2);
+
+//dimmerLamp dimmerL1(CHANNEL_L1, ZEROCROSS); // initialase port for dimmer for MEGA, Leonardo, UNO, Arduino M0, Arduino Zero
+//dimmerLamp dimmerL2(CHANNEL_L2, ZEROCROSS); // initialase port for dimmer for MEGA, Leonardo, UNO, Arduino M0, Arduino Zero
+
+// ------------------ Main Program ------------------
+void setup()
+{
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  while (!Serial)
+    ;
+  Serial.println("Serial Communication Ready...");
+  Serial.println("ESP32 I2C Slave");
+  DimmableLight::setSyncPin(ZEROCROSS);
+  DimmableLight::begin();
+  //dimmerL1.begin(NORMAL_MODE, ON); // initialase dimmer for channel 1
+  //dimmerL2.begin(NORMAL_MODE, ON); // initialase dimmer for channel 2
+  pinMode(INTERRUPT_PIN, OUTPUT);
+  Wire.begin(I2C_SlaveAddress, SDA_PIN, SCL_PIN, FastMode);
+  Wire.onRequest(requestEvent);
+  Wire.onReceive(receiveEvent);
+  delay(1000);
+  // HandShake();
+}
+
+void loop()
+{
+
+}
+// ------------------ Functions ------------------
+
+void ReflowProcess(int setTemp)
+{
+  while (referenceTemp != 0)
+  {
+    static unsigned long lastTempSampleTime = 0; // last time temperature was sampled
+    static unsigned long lastPIDUpdateTime = 0;  // last time PID was updated
+    unsigned long currentTime = millis();        // current time
+    int num_sample = 0;                          // number of samples
+    if (currentTime - lastTempSampleTime >= 250) // sample temperature every 250ms
+    {
+      float temp_read = readTemperature();                                                     // read temperature from thermocouple
+      temperatura_average = (temperatura_average * num_sample + temp_read) / (num_sample + 1); // calculate average temperature
+      num_sample++;                                                                            // increment number of samples
+      lastTempSampleTime = currentTime;                                                        // update last time temperature was sampled
+    }
+
+    if (currentTime - lastPIDUpdateTime >= 1000) // update PID every 1s (4 samples)
+    {
+      num_sample = 0;                                           // reset number of samples
+      float pid_output = pid.PID(temperatura_average, setTemp); // calculate PID output
+      control_ACDimer(pid_output);                              // control AC dimmer with PID output value
+      Serial.println(temperatura_average);                      // print temperature
+      strcpy(command, "RDTM");
+      dtostrf(temperatura_average, 6, 2, TxData.data);
+      sendEvent(TxData.data, command, TxData);
+      temperatura_average = 0;         // reset average temperature
+      lastPIDUpdateTime = currentTime; // update last time PID was updated
+    }
+  }
+}
+
+// ------------------ AC Dimmer Control ------------------
+void control_ACDimer(float PID_InputValue)
+{
+  // Mapear el valor del control a un ciclo de trabajo PWM de 0 a 100
+  float duty_scale = map(PID_InputValue, -255, 255, 255, 0); // 0% to 100% duty cycle output scale for the dimmer
+
+}
+
+// // ------------------ menu interaction ------------------
+
+void menu_interaction(const char* menuOption)
+{
+  switch (getCommand(menuOption))
+  {
+  case HSKP:
+    HandShake();
+    break;
+  case STMP: // Set desired temperature
+    // Parse the desired temperature from RxData.data and store it in a variable
+    referenceTemp = atof(RxData.data);
+    Serial.print("Desired temperature set to: ");
+    Serial.println(referenceTemp);
+    break;
+
+  case RFLO: // Start reflowing
+    // Implement start reflowing functionality
+    //ReflowProcess(referenceTemp);
+    Serial.println("Starting reflow");
+    break;
+
+  case RFST: // Stop reflowing
+    // Implement stop reflowing functionality
+    referenceTemp = 0;
+    Serial.println("Stopping reflow");
+    break;
+  case RDTM: // Read temperature
+    // Implement read temperature functionality
+    Serial.print("Current temperature: ");
+    //Serial.println(readTemperature());
+    break;
+  case MPID: // Set/Modify PID values
+    // Parse the PID values from RxData.data and store them in Kp, Ki, Kd variables
+    sscanf(RxData.data, "Kp:%f Ki:%f Kd:%f", &Kp, &Ki, &Kd);
+    pid.SetPIDTunning(Kp, Ki, Kd);
+    Serial.print("PID values updated: Kp = ");
+    Serial.print(Kp);
+    Serial.print(", Ki = ");
+    Serial.print(Ki);
+    Serial.print(", Kd = ");
+    Serial.println(Kd);
+    break;
+  default:
+    Serial.println("Invalid menu option");
+    break;
+  }
+}
+
+// // ------------------ Temperature Sensor ------------------
+
+float readTemperature()
+{
+  return thermocouple.readCelsius();
+  // For the MAX6675 to update, you must delay AT LEAST 250ms between reads!
+}
+
+// ------------------ I2C Communication ------------------
+void pinRequestInterrupt()
+{
+  digitalWrite(INTERRUPT_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(INTERRUPT_PIN, LOW);
+}
+
+void receiveEvent(int _numBytes)
+{
+  // Read the incoming data from the master device
+  if (Wire.available() && _numBytes == sizeof(RxData))
+  {
+    Wire.readBytes((byte *)&RxData, sizeof(RxData));
+  }
+  // Process the incoming data as needed
+  Serial.print("Received data: ");
+  Serial.println(RxData.data);
+  // int menuOption = atoi(RxData.command);
+  //menu_interaction(RxData.command);
+}
+
+void sendEvent(char data[32], char command[5], I2CData &Txdata)
+{
+  strncpy(Txdata.command, command, sizeof(Txdata.command) - 1);
+  strncpy(Txdata.data, data, sizeof(Txdata.data) - 1);
+  pinRequestInterrupt();
+}
+
+void requestEvent()
+{
+  Wire.write((byte *)&TxData, sizeof(TxData));
+}
+
+void HandShake()
+{
+  // put your main code here, to run repeatedly:
+  strcpy(data, "Hello from SLAVE");
+  strcpy(command, "HSKE");
+  sendEvent(data, command, TxData);
+  delay(1000);
+}
